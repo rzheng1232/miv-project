@@ -33,7 +33,7 @@ class ddiffpg():
         # return action 
     
     def update_policy():
-        """Update diffusion policy weights indirectly using target action and behavorial cloning objective"""
+        """Update diffusion policy weights indirectly using target action and behavorial cloning objective """
 
     
     
