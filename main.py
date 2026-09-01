@@ -16,7 +16,8 @@ def get_action(state):
 
 
 def main():
-    env = gym.make('Ant-v5')
+    env = gym.make_vec("Ant-v5", num_envs=256, vectorization_mode="sync")
+    
     
 
 main()
