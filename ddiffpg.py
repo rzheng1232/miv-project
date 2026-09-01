@@ -56,6 +56,36 @@ class DiffusionNet(nn.Module):
         return self.mlp(
             torch.cat([self.t_mlp(SinusoidalEmbedding(t, self.t_emb_size)), state, x], dim=-1))
 
+class CriticNet(nn.Module):
+    def __init__(self, StateDim, ActionDim, num_atoms=51):
+        super().__init__()
+        self.mlp = nn.Sequential(
+                nn.Linear(StateDim + ActionDim, 512),
+                nn.ELU(),
+                nn.Linear(512, 256),
+                nn.ELU(),
+                nn.Linear(256, 128),
+                nn.ELU(),
+                nn.Linear(256, num_atoms),
+            )
+
+    def forward(self, state, action):
+        return self.q1mlp(torch.cat([state, action], dim=-1))
+
+class Critic():
+    
+    def __init__(self, StateDim, ActionDim):
+        """Distributional Double Q Critic"""
+        self.q1 = CriticNet(StateDim, ActionDim)
+        self.q2 = CriticNet(StateDim, ActionDim)
+
+    def getq1q2(self, state, action):
+        return torch.softmax(self.q1.forward(state, action)), torch.softmax(self.q2.forward(state, action))
+    def getqmin(self, state, action):
+        Q1, Q2 = self.getq1q2(state, action)
+        Q1 = torch.sum(Q1 * self.z_atoms.to(self.device), dim=1)
+        Q2 = torch.sum(Q2 * self.z_atoms.to(self.device), dim=1)
+        return torch.min(Q1, Q2)
 
 class DiffusionPolicy():
     def __init__(self, state_size, action_size, num_steps, beta):
@@ -160,8 +190,8 @@ class ddiffpg():
         for i in range(N_old, N_new):
             for j in range(N_new):
                 if (i == j): continue
-                dist_matrix[i][j] = dtw_ndim.distance(self.trajectories[i], self.trajectories[j])
-                dist_matrix[j][i] = dtw_ndim.distance(self.trajectories[i], self.trajectories[j])
+                dist_matrix[i][j] = dtw_ndim.distance(self.finished[i], self.finished[j])
+                dist_matrix[j][i] = dtw_ndim.distance(self.finished[i], self.finished[j])
         self.dist_matrix_cache = dist_matrix
         #clustering
         dist_matrix = squareform(dist_matrix)
@@ -184,15 +214,18 @@ class ddiffpg():
                         max_matches = matches
                         max_group = j
                 if (matches == 0):
-                    # new group
+                    # new group, create new Q function,new embedding for mode
                 else:
                     # if group alreadly exists, check if this is the one with the most matches for this group
                     # if so, use existing Q function
-                    # if not, then branch and create copy of Q function
+                    # if not, then branch and create copy of Q function and new mode embedding 
+
                     
         for i in range(len(self.finished)):
             for j in range(len(self.finished[i])):
                 action_target = self.Q_functions[self.finished[2]]
+
+                # TODO: update target action with actual actiongradient not Q fucntion im stupid
                 self.finished[i][j].a_target = self.finished[i][j].a + self.lr * self.Q_functions[self.finished[2]](self.finished[i][j].s, self.finished[i][j].a)
         return dist_matrix
 
