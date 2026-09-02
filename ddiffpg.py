@@ -17,17 +17,21 @@ def BuildTransitionState(s_curr, a, s_next):
 
 @dataclass
 class TransitionState:
+    
     s: torch.Tensor
     a: torch.Tensor
     a_target: torch.Tensor
     s_next: torch.Tensor
     r: torch.Tensor
+    mode_id: int = -1
 
 @dataclass
 class TrajMode:
     id: int
+    embedding: torch.Tensor
     prev_cluster: list[int] = field(default_factory=list)
-    s: 
+    
+
 class DiffusionNet(nn.Module):
     def __init__(self, t_emb_size, activation_fn=nn.Mish()):
         """Initialization for DiffusionNET. 
@@ -66,11 +70,11 @@ class CriticNet(nn.Module):
                 nn.ELU(),
                 nn.Linear(256, 128),
                 nn.ELU(),
-                nn.Linear(256, num_atoms),
+                nn.Linear(128, num_atoms),
             )
 
     def forward(self, state, action):
-        return self.q1mlp(torch.cat([state, action], dim=-1))
+        return self.mlp(torch.cat([state, action], dim=-1))
 
 class Critic():
     
@@ -80,7 +84,7 @@ class Critic():
         self.q2 = CriticNet(StateDim, ActionDim)
 
     def getq1q2(self, state, action):
-        return torch.softmax(self.q1.forward(state, action)), torch.softmax(self.q2.forward(state, action))
+        return torch.softmax(self.q1.forward(state, action)), torch.softmax(self.q2.forward(state, action), dim=-1)
     def getqmin(self, state, action):
         Q1, Q2 = self.getq1q2(state, action)
         Q1 = torch.sum(Q1 * self.z_atoms.to(self.device), dim=1)
@@ -131,8 +135,8 @@ class ddiffpg():
         self.num_envs = num_envs
         self.dist_matrix_cache = np.zeros((len(self.finished), len(self.finished)))
         self.traj_id = 0
-        self.cluster_prev = None
-        self.Q_functions = []
+        self.modes: dict[int, TrajMode] = {}
+        self.Q_functions: dict[int, Critic] = {} 
         self.lr = lr
     def explore_env(self, env, num_timesteps, rand, total_steps):
         """Collect environment transitions into a buffer.
@@ -149,7 +153,7 @@ class ddiffpg():
             if rand:
                 action = env.action_space.sample() 
             else:
-                # TODO: add mdoe embedding to training
+                # TODO: add mode embedding to training
                 action = self.dp.get_actions(observation, self.num_envs)
 
 
@@ -166,8 +170,6 @@ class ddiffpg():
                     self.traj_id+=1
                     self.trajectories[i] = []
             t+=1
-            
-
         
     def sample_action(self, obs, mode_embedding):
         """sample the action from the diffusion policy
@@ -176,10 +178,18 @@ class ddiffpg():
                     mode_embedding - determines what mode the diffusion policy should produce. explore_embedding or specific mode embedding 
 
                 """
-        
         state = obs + mode_embedding
         self.dp.get_actions(state, 1)
-
+    def new_mode(self, mode_id, prev_cluster, parent_mode=None, noise_scale=0.2):
+        """create a new mode embedding and add to the modes dict"""
+        if (parent_mode is None):
+            vec = torch.randn(params.embed_dim) * noise_scale
+        else:
+            vec = parent_mode.embedding.detach().clone() + torch.randn(params.embed_dim) * noise_scale
+        traj_mode= TrajMode(id=mode_id, embedding=nn.Parameter(vec), prev_cluster=prev_cluster)
+        self.modes[mode_id] = traj_mode
+        return traj_mode
+    
     def process_trajs(self):
         """Calculate non-cached dtw distances, cluster trajectories using distance matrix, calculate target actions"""
         N_old = len(self.dist_matrix_cache) if self.dist_matrix_cache is not None else 0
@@ -202,31 +212,59 @@ class ddiffpg():
         clusters = [[] for l in range(num_clusters)]
         for i in range(len(labels)):
             clusters[labels[i]-1].append(self.finished[i][1])
-        if (self.cluster_prev is not None):
+        mode_max_match_dict = {} # maps the mode to the cluster index with most match 
+        cluster_best_group = []
+        if (self.modes):
             # match this clusters back to ground truth cluster index
-
             for i in range(len(clusters)):
-                max_matches = self.clusters[i] & self.cluster_prev[0]
+                max_matches = len(set(clusters[i]) & set(self.modes[0].prev_cluster))
                 max_group = 0
-                for j in range(1, len(self.cluster_prev)):
-                    matches = self.clusters[i] & self.cluster_prev[j]
+                for j in range(1, len(self.modes)):
+                    matches = len(set(clusters[i]) & set(self.modes[j].prev_cluster))
                     if (matches>max_matches):
                         max_matches = matches
                         max_group = j
-                if (matches == 0):
+                if max_group not in mode_max_match_dict or max_matches > mode_max_match_dict[max_group][1]:
+                    mode_max_match_dict[max_group] = (i, max_matches)
+                cluster_best_group.append((max_group, max_matches))
+            for i in range(len(clusters)):
+                if (cluster_best_group[i][1] == 0):
                     # new group, create new Q function,new embedding for mode
+                    self.Q_functions[len(self.Q_functions)] = (Critic(stateDim=params.state_dim, ActionDim=params.action_dim))
+                    self.new_mode(mode_id=len(self.Q_functions)-1, prev_cluster=clusters[i])
                 else:
-                    # if group alreadly exists, check if this is the one with the most matches for this group
-                    # if so, use existing Q function
-                    # if not, then branch and create copy of Q function and new mode embedding 
-
-                    
+                    if mode_max_match_dict[cluster_best_group[i][0]][0] == i:
+                        # largest matches, so this cluster inherits original Q function and mode embedding
+                        self.modes[cluster_best_group[i][0]].prev_cluster = clusters[i]
+                    else: 
+                        parent_id = cluster_best_group[i][0]
+                        parent_critic = self.Q_functions[parent_id]
+                        cloned = Critic(stateDim=params.state_dim, ActionDim=params.action_dim)
+                        cloned.q1.load_state_dict(parent_critic.q1.state_dict())
+                        cloned.q2.load_state_dict(parent_critic.q2.state_dict())
+                        self.Q_functions[len(self.Q_functions)] = cloned
+                        self.new_mode(mode_id=len(self.Q_functions)-1, prev_cluster=clusters[i], parent_mode=self.modes[cluster_best_group[i][0]])
+                 
+        else:
+            # if no clusters previously identified, then create new Q function for each cluster
+            for i in range(len(clusters)):
+                self.Q_functions[len(self.Q_functions)] = (Critic(stateDim=params.state_dim, ActionDim=params.action_dim))
+                self.new_mode(mode_id=len(self.Q_functions)-1, prev_cluster=clusters[i])
+        traj_to_prev_mode = {}
+        for mode_id, mode in self.modes.items():
+            for tid in mode.prev_cluster:
+                traj_to_prev_mode[tid] = mode_id
+        # calculate target action from action gradient
         for i in range(len(self.finished)):
-            for j in range(len(self.finished[i])):
-                action_target = self.Q_functions[self.finished[2]]
-
-                # TODO: update target action with actual actiongradient not Q fucntion im stupid
-                self.finished[i][j].a_target = self.finished[i][j].a + self.lr * self.Q_functions[self.finished[2]](self.finished[i][j].s, self.finished[i][j].a)
+            critic = self.Q_functions[traj_to_prev_mode[self.finished[i][1]]]
+            for j in range(len(self.finished[i][0])):
+                a = self.finished[i][0][j].a.clone().detach().requires_grad_(True)
+                s = self.finished[i][0][j].s
+                qmin = critic.getqmin(s, a)
+                a_grad = torch.autograd.grad(outputs=qmin, inputs=a)[0]
+                a_target = self.finished[i][0][j].a + self.lr * a_grad
+                self.finished[i][0][j].a_target = a_target
+        
         return dist_matrix
 
     def update_policy(self):
@@ -234,8 +272,5 @@ class ddiffpg():
         loss = self.dp.get_loss(self.finished)
         loss.backward()
     
-    def update_critic():
-        """"""
-    def forward_critic():
-        """d"""
+
     
