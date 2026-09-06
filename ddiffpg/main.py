@@ -1,5 +1,5 @@
 import gymnasium as gym
-from ddiffpg import ddiffpg
+from ddiffpg.ddiffpg import ddiffpg
 def run_episode(env):
     """runs a single episode, returns reward"""
     obs, info = env.reset()

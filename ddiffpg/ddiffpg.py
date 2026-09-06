@@ -4,7 +4,7 @@ import torch.nn.functional as f
 import torch
 import random
 import numpy as np
-import params
+import ddiffpg.params as params
 from dataclasses import dataclass, field
 from dtaidistance import dtw_ndim
 from scipy.cluster.hierarchy import linkage, fcluster
