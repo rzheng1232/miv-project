@@ -1,6 +1,5 @@
 import gymnasium as gym
-import torch
-
+from ddiffpg import ddiffpg
 def run_episode(env):
     """runs a single episode, returns reward"""
     obs, info = env.reset()
@@ -17,7 +16,9 @@ def get_action(state):
 
 def main():
     env = gym.make_vec("Ant-v5", num_envs=256, vectorization_mode="sync")
-    
-    
+    m = ddiffpg(num_envs=256, lr=0.1)
+    m.explore_env(env, num_timesteps=1000)
+    m.process_trajs()
+    m.update_policy()
 
 main()
