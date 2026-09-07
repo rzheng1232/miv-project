@@ -70,7 +70,7 @@ class DiffusionNet(nn.Module):
         return self.mlp(torch.cat([t_emb, state, x], dim=-1))
 
 class CriticNet(nn.Module):
-    def __init__(self, StateDim, ActionDim, num_atoms=51):
+    def __init__(self, StateDim, ActionDim, num_atoms=51, lr=5e-4):
         super().__init__()
         self.mlp = nn.Sequential(
                 nn.Linear(StateDim + ActionDim, 512),
@@ -81,10 +81,13 @@ class CriticNet(nn.Module):
                 nn.ELU(),
                 nn.Linear(128, num_atoms),
             )
+        self.optimizer =  torch.optim.AdamW(self.mlp.parameters(), lr=lr)
+
 
     def forward(self, state, action):
         return self.mlp(torch.cat([state, action], dim=-1))
-
+    def update(self):
+        self.optimizer.step()
 class Critic():
 
     def __init__(self, StateDim, ActionDim, num_atoms=51, v_min=0, v_max=5, tau=0.05, gamma=0.99):
@@ -100,7 +103,6 @@ class Critic():
         self.target_q2 = CriticNet(StateDim, ActionDim, num_atoms).to(self.device)
         self._hard_copy(self.target_q1, self.q1)
         self._hard_copy(self.target_q2, self.q2)
-
         self.buffered_actor = DiffusionPolicy(state_size=params.state_dim, action_size=params.action_dim,
                                            num_steps=params.diffusion_steps, beta=params.beta)
         self._actor_initialized = False  # buffered_Actor has no live actor to copy from until update_buffered() runs
@@ -120,10 +122,10 @@ class Critic():
         self._soft_update(self.target_q1, self.q1)
         self._soft_update(self.target_q2, self.q2)
         if not self._actor_initialized:
-            self._hard_copy(self.buffered_actor, updated_actor)
+            self._hard_copy(self.buffered_actor.model, updated_actor.model)
             self._actor_initialized = True
         else:
-            self._soft_update(self.buffered_actor, updated_actor)
+            self._soft_update(self.buffered_actor.model, updated_actor.model)
 
     def getq1q2(self, state, action, online=True):
         if (online):
@@ -146,9 +148,15 @@ class Critic():
         bellman_expected_reward = rewards + self.gamma * self.getqmin(next_states, next_action, online=False, scalar=False)
         loss = f.cross_entropy(pred, bellman_expected_reward)
         return loss
+    def update(self):
+        torch.nn.utils.clip_grad_norm_(self.q1.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.q2.parameters(), max_norm=1.0)
+        self.q1.update()
+        self.q2.update()
 class DiffusionPolicy():
-    def __init__(self, state_size, action_size, num_steps, beta):
+    def __init__(self, state_size, action_size, num_steps, beta, lr=3e-4):
         self.model = DiffusionNet(t_emb_size = 256)
+        self.optimizer =  torch.optim.AdamW(self.model.parameters(), lr=lr)
         self.T = num_steps
         self.in_size = state_size
         self.out_size = action_size
@@ -163,7 +171,9 @@ class DiffusionPolicy():
         for k in range(1, self.T):
             t =  self.T - k
             noise_pred = self.model.forward(a, state, t)
-            a = (a - noise_pred * torch.sqrt(self.betas[t])) / torch.sqrt(1-self.betas[t])
+            a = (a - noise_pred * self.betas[t] / torch.sqrt(1-self.alpha_bars[t])) / torch.sqrt(1-self.betas[t])
+
+                                   
         return a;
         
     def get_loss(self, traj_samples):
@@ -179,7 +189,9 @@ class DiffusionPolicy():
             loss_tot += this_loss
         loss_avg = loss_tot / len(traj_samples)
         return loss_avg
-        
+    def update(self):
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
 
 class ddiffpg():
     def __init__(self, num_envs, lr):
@@ -397,16 +409,24 @@ class ddiffpg():
             next_states = torch.stack([sample.s_next for sample in training_batch])
             rewards = torch.stack([sample.r for sample in training_batch])
             critic = self.Q_functions[mode_id]
+            critic.q1.optimizer.zero_grad()
+            critic.q2.optimizer.zero_grad()
             loss = critic.get_loss(state, action, next_states, rewards)
-
+            loss.backward()
+            
+            critic.update()
+            critic.update_buffered()
+            
             # TODO: Bellman target (reward + buffered actor/critic bootstrap), critic.get_loss,
             # backward + optimizer step, then critic.update_buffered(self.dp.model)
 
     def update_policy(self):
         """Update diffusion policy weights indirectly using target action and behavorial cloning objective """
         training_batch = self.build_batch()
+        self.dp.optimizer.zero_grad()
         loss = self.dp.get_loss(training_batch)
         loss.backward()
+        self.dp.update()
     
 
     
