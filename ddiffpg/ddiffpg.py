@@ -4,21 +4,59 @@ import torch.nn.functional as f
 import torch
 import random
 import numpy as np
-import ddiffpg.params as params
+import params 
 from dataclasses import dataclass, field
 from dtaidistance import dtw_ndim
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
-def SinusoidalEmbedding(t, emb_len):
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    if torch.backends.mps.is_available():
+        return torch.device('mps')
+    return torch.device('cpu')
+
+class RunningMeanStd:
+    """Welford/Chan online mean+variance estimate, used to normalize RND intrinsic
+    rewards by their running std (scale only, no mean-centering - standard RND practice,
+    since centering could push an otherwise-nonnegative novelty signal negative)."""
+    def __init__(self, eps=1e-4):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = eps
+
+    def update(self, x):
+        x = torch.as_tensor(x, dtype=torch.float32).flatten()
+        batch_count = x.numel()
+        batch_mean = x.mean().item()
+        batch_var = ((x - batch_mean) ** 2).mean().item()  # biased; well-defined even for batch_count=1
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / tot_count
+        new_var = m2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+    def normalize(self, x):
+        return x / (self.var ** 0.5 + 1e-8)
+
+def SinusoidalEmbedding(t, emb_len, device=None):
     """calculates the sinusoidal time embedding for timestep t (t is a scalar diffusion step)"""
     half_dim = emb_len // 2
-    freqs = torch.exp(-np.log(10000.0) * torch.arange(half_dim, dtype=torch.float32) / half_dim)
-    t = torch.as_tensor(t, dtype=torch.float32).reshape(())
+    freqs = torch.exp(-np.log(10000.0) * torch.arange(half_dim, dtype=torch.float32, device=device) / half_dim)
+    t = torch.as_tensor(t, dtype=torch.float32, device=device).reshape(())
     args = t * freqs
     emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
     if emb_len % 2 == 1:
-        emb = torch.cat([emb, torch.zeros(1)], dim=-1)
+        emb = torch.cat([emb, torch.zeros(1, device=device)], dim=-1)
     return emb
 
 @dataclass
@@ -29,6 +67,7 @@ class TransitionState:
     a_target: torch.Tensor
     s_next: torch.Tensor
     r: torch.Tensor
+    r_intrinsic: torch.Tensor
     mode_id: int = -1
 
 @dataclass
@@ -63,7 +102,7 @@ class DiffusionNet(nn.Module):
 
     def forward(self, x, state, t):
         # forward process
-        t_emb = self.t_mlp(SinusoidalEmbedding(t, self.t_emb_size))
+        t_emb = self.t_mlp(SinusoidalEmbedding(t, self.t_emb_size, device=x.device))
         if x.dim() > 1:
             # t is a single scalar diffusion step shared by the whole batch; broadcast it to match
             t_emb = t_emb.unsqueeze(0).expand(x.shape[0], -1)
@@ -90,12 +129,14 @@ class CriticNet(nn.Module):
         self.optimizer.step()
 class Critic():
 
-    def __init__(self, StateDim, ActionDim, num_atoms=51, v_min=0, v_max=5, tau=0.05, gamma=0.99):
+    def __init__(self, StateDim, ActionDim, num_atoms=51, val_min=0, val_max=5, tau=0.05, gamma=0.99):
         """Distributional Double Q Critic, with buffered (target) copies of Q1, Q2, and the actor
         used only to construct Bellman targets - never trained directly by backprop."""
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = get_device()
         self.tau = tau
-        self.z_atoms = torch.linspace(v_min, v_max, num_atoms).to(self.device)
+        self.val_min=val_min
+        self.val_max = val_max
+        self.z_atoms = torch.linspace(val_min, val_max, num_atoms).to(self.device)
         self.gamma = torch.tensor(gamma, device=self.device)
         self.q1 = CriticNet(StateDim, ActionDim, num_atoms).to(self.device)
         self.q2 = CriticNet(StateDim, ActionDim, num_atoms).to(self.device)
@@ -141,12 +182,26 @@ class Critic():
         else:
             use_q1 = (E1 <= E2).unsqueeze(-1)  
             return torch.where(use_q1, Q1, Q2)
-    def get_loss(self, states_samples, actions_samples, next_states, rewards):
+    def get_loss(self, states_samples, actions_samples, next_states, rewards, mode_embedding):
         """bellman update loss for distributional double Q learning"""
-        pred = self.getqmin(states_samples, actions_samples, online=True, scalar=False)
-        next_action = self.buffered_actor.get_actions(next_states, next_states.shape[0])
-        bellman_expected_reward = rewards + self.gamma * self.getqmin(next_states, next_action, online=False, scalar=False)
-        loss = f.cross_entropy(pred, bellman_expected_reward)
+        q1, q2 = self.getq1q2(states_samples, actions_samples, online=True)
+        with torch.no_grad():
+            mode_emb_batch = mode_embedding.expand(next_states.shape[0], -1)
+            next_action = self.buffered_actor.get_actions(torch.cat([next_states, mode_emb_batch], dim=-1), next_states.shape[0])
+            target_prb = self.getqmin(next_states, next_action, online=False, scalar=False)
+            Tz = (rewards.unsqueeze(-1) + self.gamma * self.z_atoms).clamp(self.val_min, self.val_max)
+            delta_z = (self.z_atoms[1] - self.z_atoms[0])
+            b = (Tz - self.val_min) / delta_z
+            lower = torch.floor(b).long()
+            upper = (lower + 1).clamp(max=len(self.z_atoms) - 1)
+            m = torch.zeros_like(target_prb)
+            w_u = b - lower.float()                
+            w_l = 1.0 - w_u
+            m.scatter_add_(-1, lower, target_prb * w_l)
+            m.scatter_add_(-1, upper, target_prb * w_u)
+
+        loss  = -(m * torch.log(q1 + 1e-8)).sum(-1).mean() - (m * torch.log(q2 + 1e-8)).sum(-1).mean()
+
         return loss
     def update(self):
         torch.nn.utils.clip_grad_norm_(self.q1.parameters(), max_norm=1.0)
@@ -155,19 +210,20 @@ class Critic():
         self.q2.update()
 class DiffusionPolicy():
     def __init__(self, state_size, action_size, num_steps, beta, lr=3e-4):
-        self.model = DiffusionNet(t_emb_size = 256)
+        self.device = get_device()
+        self.model = DiffusionNet(t_emb_size = 256).to(self.device)
         self.optimizer =  torch.optim.AdamW(self.model.parameters(), lr=lr)
         self.T = num_steps
         self.in_size = state_size
         self.out_size = action_size
         self.beta_strt = 1e-4 # from ddpm original paper
-        self.beta_end = 2e-2 
-        self.betas = torch.linspace(self.beta_strt, self.beta_end, self.T)
+        self.beta_end = 2e-2
+        self.betas = torch.linspace(self.beta_strt, self.beta_end, self.T).to(self.device)
         self.alpha_bars = torch.cumprod(1 - self.betas, dim=0)
-        
+
     def get_actions(self, state, num_envs):
         # denoise action from random vector of dim (1, action_size)
-        a = torch.randn(num_envs, self.out_size)
+        a = torch.randn(num_envs, self.out_size, device=self.device)
         for k in range(1, self.T):
             t =  self.T - k
             noise_pred = self.model.forward(a, state, t)
@@ -177,14 +233,15 @@ class DiffusionPolicy():
         return a;
         
     def get_loss(self, traj_samples):
-        # assume one transition state sample is a struct that contains (s, a, a_target, s', r)
+        # traj_samples is a list of (sample, mode_embedding) pairs - see build_batch
         loss_tot = 0
-        for sample in traj_samples:
+        for sample, mode_embedding in traj_samples:
             t = random.randint(1, self.T - 1)
             eps = torch.randn_like(sample.a)
             # key: train to diffuse torwards a_target instead of a
             noised_act = torch.sqrt(self.alpha_bars[t])*sample.a_target + eps * torch.sqrt(1-self.alpha_bars[t])
-            eps_pred = self.model.forward(noised_act, sample.s, t)
+            state = torch.cat([sample.s, mode_embedding])
+            eps_pred = self.model.forward(noised_act, state, t)
             this_loss = torch.dist(eps, eps_pred)
             loss_tot += this_loss
         loss_avg = loss_tot / len(traj_samples)
@@ -195,6 +252,7 @@ class DiffusionPolicy():
 
 class ddiffpg():
     def __init__(self, num_envs, lr):
+        self.device = get_device()
         self.trajectories = [[] for _ in range(num_envs)]
         self.success_trajs = []
         self.fail_trajs = []
@@ -207,7 +265,75 @@ class ddiffpg():
         self.modes: dict[int, TrajMode] = {}
         self.Q_functions: dict[int, Critic] = {}
         self.lr = lr
-        self.target_vel = [1.0] * num_envs  # TODO: set/sample real per-episode target velocities
+        self.target_vel = [1.0] * num_envs  #: set/sample real per-episode target velocities
+        self.mode_explore_embedding = nn.Parameter(torch.randn(params.embed_dim, device=self.device) * 0.2)
+        self.rnd_reward_rms = RunningMeanStd()
+        # q_explore's reward (normalized RND error) has a different scale/distribution than
+        # bounded task reward, and with gamma close to 1 the discounted return can sum much
+        # higher than a per-step ~unit-scale reward suggests - give it a wider atom range
+        # than the task-reward critics' default [0, 5]. Revisit once real rnd_loss/intrinsic
+        # reward magnitudes are visible from an actual run.
+        self.q_explore = Critic(StateDim=params.state_dim, ActionDim=params.action_dim, val_min=0, val_max=20)
+        self.pred_exp_r_mlp = nn.Sequential(nn.Linear(params.state_dim, 512), nn.ELU(),
+                                        nn.Linear(512, 256), nn.ELU(),
+                                        nn.Linear(256, 128), nn.ELU(),
+                                        nn.Linear(128, 128)).to(self.device)
+        self.pred_exp_r_target = nn.Sequential(nn.Linear(params.state_dim, 512), nn.ELU(),
+                                     nn.Linear(512, 256), nn.ELU(),
+                                     nn.Linear(256, 128), nn.ELU(),
+                                     nn.Linear(128, 128)).to(self.device)
+        self.exp_r_opt =  torch.optim.AdamW(self.pred_exp_r_mlp.parameters(), lr=lr)
+        for layer in self.pred_exp_r_mlp:          # nn.Sequential is iterable — yields Linear, ELU, Linear, ELU, ...
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=1.0)
+                nn.init.zeros_(layer.bias)
+        for layer in self.pred_exp_r_target:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=1.0)
+                nn.init.zeros_(layer.bias)
+        for param in self.pred_exp_r_target.parameters():
+            param.requires_grad = False
+        self.fall_count = 0
+        self.timeout_fail_count = 0
+        self.last_critic_loss = None
+        self.last_explore_critic_loss = None
+        self.last_rnd_loss = None
+        self.last_policy_loss = None
+    def get_exploration_p(self, step, total_steps):
+        # linear scheduling of exploration ratio
+        start_val = 0
+        end_val = 1
+        if (len(self.modes) != 0):
+            p = start_val + step * (end_val - start_val) / total_steps
+        else: 
+            p = 0.0
+        return p
+    def get_exploration_reward(self, state):
+        pred_r = self.pred_exp_r_mlp(state)
+        t = self.pred_exp_r_target(state)
+        loss = (pred_r - t)*(pred_r-t)
+        return loss.sum(-1)
+    
+         
+    
+    def select_embedding(self, p):
+        
+        embs = self.mode_explore_embedding.expand(self.num_envs, -1).clone()
+        if (len(self.modes) != 0):
+            num_refine_envs = round(p * self.num_envs)
+            mode_ids = list(self.modes.keys())
+            envs_per_mode = num_refine_envs // len(mode_ids)
+            remainder = num_refine_envs % len(mode_ids)
+            curr_insert_ind = 0
+            for id in mode_ids:
+                embs[curr_insert_ind:curr_insert_ind+envs_per_mode] = self.modes[id].embedding 
+                curr_insert_ind+=envs_per_mode
+            while(curr_insert_ind < num_refine_envs):
+                id = mode_ids[curr_insert_ind % len(mode_ids)]
+                embs[curr_insert_ind] = self.modes[id].embedding
+                curr_insert_ind+=1
+        return embs
+        
     def explore_env(self, env, num_timesteps, rand, total_steps):
         """Collect environment transitions into a buffer.
         Args:
@@ -217,7 +343,9 @@ class ddiffpg():
             total_steps (int): Total number of updates completed in the training session.
                 Used to schedule exploration decay.
         """
+        p = self.get_exploration_p(total_steps, params.total_train_steps)
         observation, info = env.reset()
+        observation = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
         t = 0
         success_streak = [0 for _ in range(self.num_envs)]
         episode_len = [0 for _ in range(self.num_envs)]
@@ -225,13 +353,19 @@ class ddiffpg():
 
             if rand:
                 action = env.action_space.sample()
+                action_t = torch.as_tensor(action, dtype=torch.float32, device=self.device)
             else:
-                # TODO: add mode embedding to training
-                action = self.dp.get_actions(observation, self.num_envs)
+                # Schedules the rollout so that existing modes can be reinforced while new modes are still being discovered
+                mode_emb = self.select_embedding(p)
+                with torch.no_grad():
+                    action_t = self.dp.get_actions(torch.cat([observation, mode_emb], dim=-1), self.num_envs)
+                action = action_t.cpu().numpy()
 
 
             obs_prev = observation
             observation, reward, terminated, truncated, info = env.step(action)
+            observation = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
+            reward = torch.as_tensor(reward, dtype=torch.float32, device=self.device)
             episode_over = np.logical_or(terminated, truncated)
 
             for i in range(self.num_envs):
@@ -239,37 +373,60 @@ class ddiffpg():
                 v_x = info["x_velocity"][i]
                 if abs(v_x - self.target_vel[i]) <= 0.05:
                     success_streak[i] += 1
-
-                ts = TransitionState(obs_prev[i], action[i], action[i], observation[i], reward[i])
+                with torch.no_grad():
+                    raw_intrinsic_reward = self.get_exploration_reward(observation[i].unsqueeze(0)).squeeze(0)
+                    self.rnd_reward_rms.update(raw_intrinsic_reward.cpu())
+                    intrinsic_reward = self.rnd_reward_rms.normalize(raw_intrinsic_reward)
+                ts = TransitionState(obs_prev[i], action_t[i], action_t[i], observation[i], reward[i]+intrinsic_reward, intrinsic_reward)
                 self.trajectories[i].append(ts)
                 if (episode_over[i]):
+                    new_v_target = random.uniform(params.v_min, params.v_max)
+                    self.target_vel[i] = new_v_target
+
                     if (terminated[i]):
                         self.fail_trajs.append((self.trajectories[i], self.traj_id))
+                        self.fall_count += 1
                     elif (success_streak[i]/episode_len[i] > 0.5):
                         self.success_trajs.append((self.trajectories[i], self.traj_id))
                     else:
                         self.fail_trajs.append((self.trajectories[i], self.traj_id))
+                        self.timeout_fail_count += 1
                     self.traj_id+=1
                     self.trajectories[i] = []
                     success_streak[i] = 0
                     episode_len[i] = 0
             t+=1
-        
-    def sample_action(self, obs, mode_embedding):
-        """sample the action from the diffusion policy
-                Args:
-                    obs - the current timestep observation of the agent to produce the action from
-                    mode_embedding - determines what mode the diffusion policy should produce. explore_embedding or specific mode embedding 
+        self._evict_old_trajectories()
+        return num_timesteps * self.num_envs
 
-                """
-        state = obs + mode_embedding
-        self.dp.get_actions(state, 1)
+    def _evict_old_trajectories(self):
+        total = len(self.success_trajs) + len(self.fail_trajs)
+        if total <= params.memory_size:
+            return
+        to_evict = total - params.memory_size
+        evicted_ids = set()
+        success_evicted = False
+        while to_evict > 0 and (self.success_trajs or self.fail_trajs):
+            oldest_success_id = self.success_trajs[0][1] if self.success_trajs else None
+            oldest_fail_id = self.fail_trajs[0][1] if self.fail_trajs else None
+            if oldest_fail_id is not None and (oldest_success_id is None or oldest_fail_id < oldest_success_id):
+                evicted_ids.add(self.fail_trajs.pop(0)[1])
+            else:
+                evicted_ids.add(self.success_trajs.pop(0)[1])
+                success_evicted = True
+            to_evict -= 1
+        if evicted_ids:
+            for mode in self.modes.values():
+                mode.prev_cluster = [tid for tid in mode.prev_cluster if tid not in evicted_ids]
+        if success_evicted:
+            self.dist_matrix_cache = np.zeros((0, 0))  # force a full DTW recompute next process_trajs
+
     def new_mode(self, mode_id, prev_cluster, parent_mode=None, noise_scale=0.2):
         """create a new mode embedding and add to the modes dict"""
         if (parent_mode is None):
-            vec = torch.randn(params.embed_dim) * noise_scale
+            vec = torch.randn(params.embed_dim, device=self.device) * noise_scale
         else:
-            vec = parent_mode.embedding.detach().clone() + torch.randn(params.embed_dim) * noise_scale
+            vec = parent_mode.embedding.detach().clone() + torch.randn(params.embed_dim, device=self.device) * noise_scale
         traj_mode= TrajMode(id=mode_id, embedding=nn.Parameter(vec), prev_cluster=prev_cluster)
         self.modes[mode_id] = traj_mode
         return traj_mode
@@ -282,13 +439,13 @@ class ddiffpg():
             return clusters
         traj_by_id = {tid: traj for traj, tid in self.success_trajs}
         for traj, traj_id in self.fail_trajs:
-            query = [ts.s for ts in traj]
+            query = [ts.s.cpu().numpy() for ts in traj]
             best_idx, best_avg_dist = None, float('inf')
             for idx, cluster in enumerate(clusters):
                 if not cluster:
                     continue
                 sample_ids = random.sample(cluster, min(N, len(cluster)))
-                dists = [dtw_ndim.distance(query, [ts.s for ts in traj_by_id[sid]]) for sid in sample_ids]
+                dists = [dtw_ndim.distance(query, [ts.s.cpu().numpy() for ts in traj_by_id[sid]]) for sid in sample_ids]
                 avg_dist = sum(dists) / len(dists)
                 if avg_dist < best_avg_dist:
                     best_avg_dist = avg_dist
@@ -301,14 +458,17 @@ class ddiffpg():
         """Calculate non-cached dtw distances, cluster trajectories using distance matrix, calculate target actions"""
         N_old = len(self.dist_matrix_cache) if self.dist_matrix_cache is not None else 0
         N_new = len(self.success_trajs)
+        if N_new < 2:
+            # not enough successful trajectories yet to form any clusters
+            return None
         dist_matrix = np.zeros((N_new,N_new))
         if (N_old > 0):
             dist_matrix[:N_old, :N_old] = self.dist_matrix_cache
         for i in range(N_old, N_new):
             for j in range(N_new):
                 if (i == j): continue
-                states_i = [ts.s for ts in self.success_trajs[i][0]]
-                states_j = [ts.s for ts in self.success_trajs[j][0]]
+                states_i = [ts.s.cpu().numpy() for ts in self.success_trajs[i][0]]
+                states_j = [ts.s.cpu().numpy() for ts in self.success_trajs[j][0]]
                 d = dtw_ndim.distance(states_i, states_j)
                 dist_matrix[i][j] = d
                 dist_matrix[j][i] = d
@@ -375,57 +535,106 @@ class ddiffpg():
                     continue
                 critic = self.Q_functions[mode_id]
                 for ts in traj:
-                    a = ts.a.clone().detach().requires_grad_(True)
-                    qmin = critic.getqmin(ts.s, a)
-                    a_grad = torch.autograd.grad(outputs=qmin, inputs=a)[0]
-                    ts.a_target = ts.a + self.lr * a_grad
+                    a_target = ts.a.clone()
+                    for _ in range(params.action_update_times):
+                        a_target = a_target.detach().requires_grad_(True)
+                        qmin = critic.getqmin(ts.s, a_target)
+                        a_grad = torch.autograd.grad(outputs=qmin, inputs=a_target)[0]
+                        a_target = a_target + self.lr * a_grad
+                    ts.a_target = a_target.detach()
 
         return dist_matrix
     def _mode_transitions(self, mode_id):
         """Flatten every transition belonging to trajectories currently assigned to mode_id."""
-        traj_by_id = {tid: traj for traj, tid in self.success_trajs + self.fail_trajs}
         transitions = []
+        if (mode_id == -1):
+            for traj, _ in self.success_trajs + self.fail_trajs:
+                transitions.extend(traj)
+            return transitions
+        traj_by_id = {tid: traj for traj, tid in self.success_trajs + self.fail_trajs}
         for tid in self.modes[mode_id].prev_cluster:
             transitions.extend(traj_by_id[tid])
         return transitions
 
-    def build_batch(self, batch_size=4096):
+    def build_batch(self, batch_size=params.batch_size):
+        """Returns a list of (sample, mode_embedding) pairs - each sample paired with
+        the embedding of whichever mode it was drawn from, since a single multimodal
+        batch mixes samples from different modes and the diffusion policy needs to
+        know which mode's behavior each sample represents."""
+        if not self.modes:
+            pool = self._mode_transitions(-1)
+            if not pool:
+                return []
+            samples = random.choices(pool, k=batch_size)
+            return [(s, self.mode_explore_embedding) for s in samples]
         size_per_mode = batch_size // len(self.modes)
         batch = []
         for m_id in self.modes:
             pool = self._mode_transitions(m_id)
             if not pool:
                 continue
-            batch += random.choices(pool, k=size_per_mode)
+            samples = random.choices(pool, k=size_per_mode)
+            emb = self.modes[m_id].embedding
+            batch += [(s, emb) for s in samples]
         return batch
     def update_critic(self):
+        critic_losses = []
         for mode_id in self.modes:
             pool = self._mode_transitions(mode_id)
             if not pool:
                 continue
-            training_batch = random.choices(pool, k=2000)
+            training_batch = random.choices(pool, k=params.batch_size)
             state = torch.stack([sample.s for sample in training_batch])
             action = torch.stack([sample.a for sample in training_batch])
             next_states = torch.stack([sample.s_next for sample in training_batch])
             rewards = torch.stack([sample.r for sample in training_batch])
+
             critic = self.Q_functions[mode_id]
             critic.q1.optimizer.zero_grad()
             critic.q2.optimizer.zero_grad()
-            loss = critic.get_loss(state, action, next_states, rewards)
+            loss = critic.get_loss(state, action, next_states, rewards, self.modes[mode_id].embedding)
             loss.backward()
-            
+            critic_losses.append(loss.item())
+
             critic.update()
-            critic.update_buffered()
-            
-            # TODO: Bellman target (reward + buffered actor/critic bootstrap), critic.get_loss,
-            # backward + optimizer step, then critic.update_buffered(self.dp.model)
+            critic.update_buffered(self.dp)
+        self.last_critic_loss = sum(critic_losses) / len(critic_losses) if critic_losses else None
+
+        # also update the Q_explore
+        pool = self._mode_transitions(-1)
+        if not pool:
+            return
+        training_batch = random.choices(pool, k=params.batch_size)
+        state = torch.stack([sample.s for sample in training_batch])
+        action = torch.stack([sample.a for sample in training_batch])
+        next_states = torch.stack([sample.s_next for sample in training_batch])
+        rewards = torch.stack([sample.r_intrinsic for sample in training_batch])
+        critic = self.q_explore
+        critic.q1.optimizer.zero_grad()
+        critic.q2.optimizer.zero_grad()
+        loss = critic.get_loss(state, action, next_states, rewards, self.mode_explore_embedding)
+        loss.backward()
+        self.last_explore_critic_loss = loss.item()
+        critic.update()
+        critic.update_buffered(self.dp)
+
+        training_batch = random.choices(pool, k=params.batch_size)
+        state = torch.stack([sample.s for sample in training_batch])
+        self.exp_r_opt.zero_grad()
+        loss = self.get_exploration_reward(state).mean()
+        self.last_rnd_loss = loss.item()
+        loss.backward()
+        self.exp_r_opt.step()
 
     def update_policy(self):
         """Update diffusion policy weights indirectly using target action and behavorial cloning objective """
         training_batch = self.build_batch()
+        if not training_batch:
+            return
         self.dp.optimizer.zero_grad()
         loss = self.dp.get_loss(training_batch)
         loss.backward()
+        self.last_policy_loss = loss.item()
         self.dp.update()
     
 
