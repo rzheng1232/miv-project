@@ -37,7 +37,21 @@ Ant-v5 and MsPacman environments.
   Ant, so I moved on to the next task.
 - I did not get a chance to test the MsPacman environment, but here is my
   intended approach:
-  - 
+  - Initially, I expected to approach this problem with a straightforward
+  drop-in of the DDiffPG algorithm into the MsPacman environment. However, I
+  realized that DDiffPG's core mechanism relies on differentiating the critic
+  (Q-function) with respect to the action to compute an action gradient, which
+  is used to calculate a shifting behavioral-cloning target. Since MsPacman is
+  a discrete action environment, there isn't an action gradient to compute in
+  the same sense. My current plan is to swap the diffusion action head for a
+  mode-conditioned categorical policy, while keeping the rest of the
+  mode-discovery and mode-conditioning machinery. In this approach, the
+  behavioral-cloning target would be a probability distribution over the
+  discrete actions rather than a single action vector, likely derived by
+  reweighting the target distribution toward higher-Q actions (e.g.
+  exponentially, similar to soft Q-learning), rather than literal gradient
+  ascent, though I did not have time to work out or validate the exact update
+  rule.
 
 ### Part 2: Wilson-Cowan Rate-Based Neuron Model
 
