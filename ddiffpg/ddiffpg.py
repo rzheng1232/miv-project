@@ -274,20 +274,16 @@ class DiffusionPolicy():
         return a;
         
     def get_loss(self, traj_samples):
-        # traj_samples is a list of (sample, mode_embedding) pairs - see build_batch
-        # batched: one forward pass for the whole batch instead of one per sample
         batch_size = len(traj_samples)
         t = torch.randint(1, self.T, (batch_size,), device=self.device)  # per-sample diffusion step
         a_target = torch.stack([sample.a_target for sample, _ in traj_samples])
         eps = torch.randn_like(a_target)
         alpha_bar_t = self.alpha_bars[t].unsqueeze(-1)
-        # key: train to diffuse torwards a_target instead of a
         noised_act = torch.sqrt(alpha_bar_t) * a_target + eps * torch.sqrt(1 - alpha_bar_t)
         states = torch.stack([sample.s for sample, _ in traj_samples])
         embs = torch.stack([emb for _, emb in traj_samples])
         state = torch.cat([states, embs], dim=-1)
         eps_pred = self.model.forward(noised_act, state, t)
-        # mean of per-sample L2 distances, matching what looping torch.dist per-sample computed
         loss_avg = torch.linalg.norm(eps - eps_pred, dim=-1).mean()
         return loss_avg
     def update(self):
@@ -323,7 +319,7 @@ class ddiffpg():
                                      nn.Linear(256, 128), nn.ELU(),
                                      nn.Linear(128, 128)).to(self.device)
         self.exp_r_opt =  torch.optim.AdamW(self.pred_exp_r_mlp.parameters(), lr=lr)
-        for layer in self.pred_exp_r_mlp:          # nn.Sequential is iterable — yields Linear, ELU, Linear, ELU, ...
+        for layer in self.pred_exp_r_mlp:      
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, gain=1.0)
                 nn.init.zeros_(layer.bias)
@@ -405,9 +401,6 @@ class ddiffpg():
         """
         p = self.get_exploration_p(total_steps, params.total_train_steps)
         if self._obs is None:
-            # only reset once, ever - env.step() auto-resets individual envs internally
-            # on episode end from here on. Resetting every call would restart every
-            # episode from scratch before it could ever actually finish.
             observation, info = env.reset()
             observation = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
             self.obs_rms.update(observation)
