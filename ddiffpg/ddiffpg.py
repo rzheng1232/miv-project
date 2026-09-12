@@ -48,15 +48,54 @@ class RunningMeanStd:
     def normalize(self, x):
         return x / (self.var ** 0.5 + 1e-8)
 
+class RunningMeanStdVec:
+    """Same Welford/Chan running estimate as RunningMeanStd, but per-dimension - for
+    normalizing vector observations. Unlike RunningMeanStd, this DOES mean-center
+    (standard practice for observation normalization, e.g. Gymnasium's own
+    NormalizeObservation wrapper) - there's no nonnegativity constraint to preserve here."""
+    def __init__(self, dim, eps=1e-4, device=None):
+        self.mean = torch.zeros(dim, device=device)
+        self.var = torch.ones(dim, device=device)
+        self.count = eps
+
+    def update(self, x):
+        x = torch.as_tensor(x, dtype=torch.float32, device=self.mean.device)
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        batch_count = x.shape[0]
+        batch_mean = x.mean(dim=0)
+        batch_var = x.var(dim=0, unbiased=False)  # well-defined even for batch_count=1
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / tot_count
+        new_var = m2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+    def normalize(self, x):
+        return (x - self.mean) / (self.var.sqrt() + 1e-8)
+
 def SinusoidalEmbedding(t, emb_len, device=None):
-    """calculates the sinusoidal time embedding for timestep t (t is a scalar diffusion step)"""
+    """calculates the sinusoidal time embedding for timestep(s) t.
+    t may be a single scalar diffusion step (shared across a batch, e.g. during sampling)
+    or a [batch] tensor of per-sample diffusion steps (e.g. during training). Always returns
+    [batch_or_1, emb_len]."""
     half_dim = emb_len // 2
     freqs = torch.exp(-np.log(10000.0) * torch.arange(half_dim, dtype=torch.float32, device=device) / half_dim)
-    t = torch.as_tensor(t, dtype=torch.float32, device=device).reshape(())
-    args = t * freqs
+    t = torch.as_tensor(t, dtype=torch.float32, device=device)
+    if t.dim() == 0:
+        t = t.reshape(1)
+    args = t.unsqueeze(-1) * freqs.unsqueeze(0)
     emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
     if emb_len % 2 == 1:
-        emb = torch.cat([emb, torch.zeros(1, device=device)], dim=-1)
+        emb = torch.cat([emb, torch.zeros(emb.shape[0], 1, device=device)], dim=-1)
     return emb
 
 @dataclass
@@ -102,10 +141,12 @@ class DiffusionNet(nn.Module):
 
     def forward(self, x, state, t):
         # forward process
-        t_emb = self.t_mlp(SinusoidalEmbedding(t, self.t_emb_size, device=x.device))
-        if x.dim() > 1:
-            # t is a single scalar diffusion step shared by the whole batch; broadcast it to match
-            t_emb = t_emb.unsqueeze(0).expand(x.shape[0], -1)
+        t_emb = self.t_mlp(SinusoidalEmbedding(t, self.t_emb_size, device=x.device))  # [B_t, t_emb_size]
+        if x.dim() > 1 and t_emb.shape[0] != x.shape[0]:
+            # t was a single scalar diffusion step shared by the whole batch (sampling); broadcast it
+            t_emb = t_emb.expand(x.shape[0], -1)
+        elif x.dim() == 1 and t_emb.shape[0] == 1:
+            t_emb = t_emb.squeeze(0)
         return self.mlp(torch.cat([t_emb, state, x], dim=-1))
 
 class CriticNet(nn.Module):
@@ -234,17 +275,20 @@ class DiffusionPolicy():
         
     def get_loss(self, traj_samples):
         # traj_samples is a list of (sample, mode_embedding) pairs - see build_batch
-        loss_tot = 0
-        for sample, mode_embedding in traj_samples:
-            t = random.randint(1, self.T - 1)
-            eps = torch.randn_like(sample.a)
-            # key: train to diffuse torwards a_target instead of a
-            noised_act = torch.sqrt(self.alpha_bars[t])*sample.a_target + eps * torch.sqrt(1-self.alpha_bars[t])
-            state = torch.cat([sample.s, mode_embedding])
-            eps_pred = self.model.forward(noised_act, state, t)
-            this_loss = torch.dist(eps, eps_pred)
-            loss_tot += this_loss
-        loss_avg = loss_tot / len(traj_samples)
+        # batched: one forward pass for the whole batch instead of one per sample
+        batch_size = len(traj_samples)
+        t = torch.randint(1, self.T, (batch_size,), device=self.device)  # per-sample diffusion step
+        a_target = torch.stack([sample.a_target for sample, _ in traj_samples])
+        eps = torch.randn_like(a_target)
+        alpha_bar_t = self.alpha_bars[t].unsqueeze(-1)
+        # key: train to diffuse torwards a_target instead of a
+        noised_act = torch.sqrt(alpha_bar_t) * a_target + eps * torch.sqrt(1 - alpha_bar_t)
+        states = torch.stack([sample.s for sample, _ in traj_samples])
+        embs = torch.stack([emb for _, emb in traj_samples])
+        state = torch.cat([states, embs], dim=-1)
+        eps_pred = self.model.forward(noised_act, state, t)
+        # mean of per-sample L2 distances, matching what looping torch.dist per-sample computed
+        loss_avg = torch.linalg.norm(eps - eps_pred, dim=-1).mean()
         return loss_avg
     def update(self):
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -253,6 +297,7 @@ class DiffusionPolicy():
 class ddiffpg():
     def __init__(self, num_envs, lr):
         self.device = get_device()
+        self._obs = None  # persists across explore_env calls; only reset once, ever
         self.trajectories = [[] for _ in range(num_envs)]
         self.success_trajs = []
         self.fail_trajs = []
@@ -265,14 +310,9 @@ class ddiffpg():
         self.modes: dict[int, TrajMode] = {}
         self.Q_functions: dict[int, Critic] = {}
         self.lr = lr
-        self.target_vel = [1.0] * num_envs  #: set/sample real per-episode target velocities
         self.mode_explore_embedding = nn.Parameter(torch.randn(params.embed_dim, device=self.device) * 0.2)
         self.rnd_reward_rms = RunningMeanStd()
-        # q_explore's reward (normalized RND error) has a different scale/distribution than
-        # bounded task reward, and with gamma close to 1 the discounted return can sum much
-        # higher than a per-step ~unit-scale reward suggests - give it a wider atom range
-        # than the task-reward critics' default [0, 5]. Revisit once real rnd_loss/intrinsic
-        # reward magnitudes are visible from an actual run.
+        self.obs_rms = RunningMeanStdVec(params.state_dim, device=self.device)
         self.q_explore = Critic(StateDim=params.state_dim, ActionDim=params.action_dim, val_min=0, val_max=20)
         self.pred_exp_r_mlp = nn.Sequential(nn.Linear(params.state_dim, 512), nn.ELU(),
                                         nn.Linear(512, 256), nn.ELU(),
@@ -295,6 +335,11 @@ class ddiffpg():
             param.requires_grad = False
         self.fall_count = 0
         self.timeout_fail_count = 0
+        self.success_count = 0  
+        self.velocity_sum = 0.0
+        self.velocity_count = 0
+        self.dist_sum = 0.0
+        self.dist_count = 0
         self.last_critic_loss = None
         self.last_explore_critic_loss = None
         self.last_rnd_loss = None
@@ -305,9 +350,24 @@ class ddiffpg():
         end_val = 1
         if (len(self.modes) != 0):
             p = start_val + step * (end_val - start_val) / total_steps
-        else: 
+        else:
             p = 0.0
         return p
+    def get_avg_velocity_and_reset(self):
+        """Average terminal-step x_velocity over episodes that completed since the last call -
+        one sample per finished episode, not per env-step, so a long-running episode can't
+        dominate the average with many autocorrelated samples from a single trajectory."""
+        avg = self.velocity_sum / self.velocity_count if self.velocity_count else float('nan')
+        self.velocity_sum = 0.0
+        self.velocity_count = 0
+        return avg
+    def get_avg_dist_and_reset(self):
+        """Average terminal-step remaining distance-to-goal over episodes that completed since
+        the last call - one sample per finished episode, same rationale as velocity above."""
+        avg = self.dist_sum / self.dist_count if self.dist_count else float('nan')
+        self.dist_sum = 0.0
+        self.dist_count = 0
+        return avg
     def get_exploration_reward(self, state):
         pred_r = self.pred_exp_r_mlp(state)
         t = self.pred_exp_r_target(state)
@@ -344,11 +404,16 @@ class ddiffpg():
                 Used to schedule exploration decay.
         """
         p = self.get_exploration_p(total_steps, params.total_train_steps)
-        observation, info = env.reset()
-        observation = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
+        if self._obs is None:
+            # only reset once, ever - env.step() auto-resets individual envs internally
+            # on episode end from here on. Resetting every call would restart every
+            # episode from scratch before it could ever actually finish.
+            observation, info = env.reset()
+            observation = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
+            self.obs_rms.update(observation)
+            self._obs = self.obs_rms.normalize(observation)
+        observation = self._obs
         t = 0
-        success_streak = [0 for _ in range(self.num_envs)]
-        episode_len = [0 for _ in range(self.num_envs)]
         while t < num_timesteps:
 
             if rand:
@@ -365,37 +430,39 @@ class ddiffpg():
             obs_prev = observation
             observation, reward, terminated, truncated, info = env.step(action)
             observation = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
+            self.obs_rms.update(observation)
+            observation = self.obs_rms.normalize(observation)
             reward = torch.as_tensor(reward, dtype=torch.float32, device=self.device)
             episode_over = np.logical_or(terminated, truncated)
 
+            with torch.no_grad():
+                raw_intrinsic_rewards = self.get_exploration_reward(observation)  # [num_envs], one batched call
+                self.rnd_reward_rms.update(raw_intrinsic_rewards.cpu())
+                intrinsic_rewards = self.rnd_reward_rms.normalize(raw_intrinsic_rewards)
+
             for i in range(self.num_envs):
-                episode_len[i] += 1
-                v_x = info["x_velocity"][i]
-                if abs(v_x - self.target_vel[i]) <= 0.05:
-                    success_streak[i] += 1
-                with torch.no_grad():
-                    raw_intrinsic_reward = self.get_exploration_reward(observation[i].unsqueeze(0)).squeeze(0)
-                    self.rnd_reward_rms.update(raw_intrinsic_reward.cpu())
-                    intrinsic_reward = self.rnd_reward_rms.normalize(raw_intrinsic_reward)
+                intrinsic_reward = intrinsic_rewards[i]
                 ts = TransitionState(obs_prev[i], action_t[i], action_t[i], observation[i], reward[i]+intrinsic_reward, intrinsic_reward)
                 self.trajectories[i].append(ts)
                 if (episode_over[i]):
-                    new_v_target = random.uniform(params.v_min, params.v_max)
-                    self.target_vel[i] = new_v_target
+                    self.velocity_sum += float(info["x_velocity"][i])
+                    self.velocity_count += 1
+                    self.dist_sum += float(info["dist_remaining"][i])
+                    self.dist_count += 1
 
-                    if (terminated[i]):
+                    if info["success"][i]:
+                        self.success_trajs.append((self.trajectories[i], self.traj_id))
+                        self.success_count += 1
+                    elif (terminated[i]):
                         self.fail_trajs.append((self.trajectories[i], self.traj_id))
                         self.fall_count += 1
-                    elif (success_streak[i]/episode_len[i] > 0.5):
-                        self.success_trajs.append((self.trajectories[i], self.traj_id))
                     else:
                         self.fail_trajs.append((self.trajectories[i], self.traj_id))
                         self.timeout_fail_count += 1
                     self.traj_id+=1
                     self.trajectories[i] = []
-                    success_streak[i] = 0
-                    episode_len[i] = 0
             t+=1
+        self._obs = observation
         self._evict_old_trajectories()
         return num_timesteps * self.num_envs
 
@@ -437,15 +504,19 @@ class ddiffpg():
         from that cluster."""
         if not clusters:
             return clusters
-        traj_by_id = {tid: traj for traj, tid in self.success_trajs}
+        # include fail_trajs too, not just success_trajs: this function appends fail-trajectory
+        # ids into clusters[idx] as it goes (clusters[idx] is often the same list object as some
+        # mode.prev_cluster), so a later iteration of this same loop can sample an id that an
+        # earlier iteration just appended - traj_by_id needs to resolve that too, not just success ids
+        traj_by_id = {tid: traj for traj, tid in self.success_trajs + self.fail_trajs}
         for traj, traj_id in self.fail_trajs:
-            query = [ts.s.cpu().numpy() for ts in traj]
+            query = [ts.s[:params.dtw_core_dim].cpu().numpy() for ts in traj]
             best_idx, best_avg_dist = None, float('inf')
             for idx, cluster in enumerate(clusters):
                 if not cluster:
                     continue
                 sample_ids = random.sample(cluster, min(N, len(cluster)))
-                dists = [dtw_ndim.distance(query, [ts.s.cpu().numpy() for ts in traj_by_id[sid]]) for sid in sample_ids]
+                dists = [dtw_ndim.distance(query, [ts.s[:params.dtw_core_dim].cpu().numpy() for ts in traj_by_id[sid]]) for sid in sample_ids]
                 avg_dist = sum(dists) / len(dists)
                 if avg_dist < best_avg_dist:
                     best_avg_dist = avg_dist
@@ -467,8 +538,8 @@ class ddiffpg():
         for i in range(N_old, N_new):
             for j in range(N_new):
                 if (i == j): continue
-                states_i = [ts.s.cpu().numpy() for ts in self.success_trajs[i][0]]
-                states_j = [ts.s.cpu().numpy() for ts in self.success_trajs[j][0]]
+                states_i = [ts.s[:params.dtw_core_dim].cpu().numpy() for ts in self.success_trajs[i][0]]
+                states_j = [ts.s[:params.dtw_core_dim].cpu().numpy() for ts in self.success_trajs[j][0]]
                 d = dtw_ndim.distance(states_i, states_j)
                 dist_matrix[i][j] = d
                 dist_matrix[j][i] = d
@@ -531,9 +602,7 @@ class ddiffpg():
         for traj_list in (self.success_trajs, self.fail_trajs):
             for traj, traj_id in traj_list:
                 mode_id = traj_to_prev_mode.get(traj_id)
-                if mode_id is None:
-                    continue
-                critic = self.Q_functions[mode_id]
+                critic = self.Q_functions[mode_id] if mode_id is not None else self.q_explore
                 for ts in traj:
                     a_target = ts.a.clone()
                     for _ in range(params.action_update_times):

@@ -21,7 +21,7 @@ update_times = 8            # cfg.algo.update_times
 batch_size = 4096           # cfg.algo.batch_size
 eval_freq = 100             # cfg.eval_freq
 log_freq = 2                 # cfg.log_freq (no logging wired up yet)
-total_train_steps = 50000  # cfg.max_step — paper uses ~3M for AntMaze-v1; cfg's own fallback default is 4M, confirm which fits Ant-v5
+total_train_steps = 3000000  # cfg.max_step — paper uses ~3M for AntMaze-v1; cfg's own fallback default is 4M, confirm which fits Ant-v5
 memory_size = 2000          # cfg.algo.memory_size — NOT enforced yet; success_trajs/fail_trajs grow unbounded
 
 # --- eval (no eval loop exists yet) ---
@@ -29,3 +29,9 @@ eval_num_envs = 20
 
 # --- DIPO-style action-gradient refinement ---
 action_update_times = 20   # cfg.diffusion.update_times — process_trajs currently only does 1 ascent step, not a K-loop
+
+# --- DTW clustering: use only the "core" kinematic state, not the full observation ---
+# z-height(1) + quaternion(4) + joint angles(8) + torso lin/ang vel(6) + joint vel(8) = 27,
+# excluding cfrc_ext (the trailing 78 dims) - contact forces dominate a raw 105-dim distance
+# by sheer count and are spiky/contact-event-driven rather than representative of gait identity.
+dtw_core_dim = 27
